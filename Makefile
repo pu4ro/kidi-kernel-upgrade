@@ -62,11 +62,11 @@ CUSTOM_REPO_GPGKEY ?=
 # On a control-plane node this lets us check node Ready + kube-system pods.
 KUBECONFIG         ?= /etc/kubernetes/admin.conf
 
-# ---- Kubernetes install (kubeadm single control-plane node) ----
-# LOCAL_RPM_REPO : createrepo'd dir with k8s + containerd RPMs
+# ---- Kubernetes install (kubeadm single control-plane node, Docker runtime) ----
+# LOCAL_RPM_REPO : createrepo'd dir with k8s + docker + cri-dockerd RPMs
 # K8S_VERSION    : kubeadm/kubelet/kubectl version to install
 # POD_CIDR       : pod network CIDR (Flannel default)
-# CRI_SOCKET     : CRI endpoint (containerd)
+# CRI_SOCKET     : CRI endpoint (dockershim - built into kubelet for k8s 1.23 + Docker)
 # FLANNEL_URL    : CNI manifest applied after kubeadm init
 # DNS_SERVER     : if set, 'make set-dns' writes it to /etc/resolv.conf
 LOCAL_RPM_REPO  ?= /root/repo
@@ -74,7 +74,7 @@ LOCAL_RPM_REPO  ?= /root/repo
 RPM_SRC         ?= $(LOCAL_RPM_REPO)
 K8S_VERSION     ?= 1.23.17
 POD_CIDR        ?= 10.244.0.0/16
-CRI_SOCKET      ?= /run/containerd/containerd.sock
+CRI_SOCKET      ?= /var/run/dockershim.sock
 FLANNEL_URL     ?= https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
 DNS_SERVER      ?=
 
@@ -105,7 +105,7 @@ help:
 	@echo "  set-dns     Write DNS_SERVER to /etc/resolv.conf (air-gapped DNS fix)"
 	@echo "  local-repo  Build repodata (createrepo_c) on a dir of RPMs (RPM_SRC)"
 	@echo "  k8s-prep    swap off, SELinux permissive, firewalld off, modules, sysctl"
-	@echo "  k8s-pkgs    Install containerd + kubelet/kubeadm/kubectl from LOCAL_RPM_REPO"
+	@echo "  k8s-pkgs    Install docker-ce + kubelet/kubeadm/kubectl (dockershim) from LOCAL_RPM_REPO"
 	@echo "  k8s-init    Pull images, kubeadm init, kubeconfig, Flannel CNI, untaint"
 	@echo "  k8s-install k8s-prep + k8s-pkgs + k8s-init"
 	@echo "  k8s-reset   Tear down the cluster (kubeadm reset)"
@@ -192,7 +192,7 @@ k8s-prep:
 
 k8s-pkgs:
 	$(require_root)
-	echo "==> Installing Kubernetes packages from $(LOCAL_RPM_REPO)"
+	echo "==> Installing Docker + cri-dockerd + Kubernetes from $(LOCAL_RPM_REPO)"
 	if [[ ! -d "$(LOCAL_RPM_REPO)/repodata" ]]; then
 		echo "ERROR: $(LOCAL_RPM_REPO)/repodata not found." >&2
 		echo "       Build it first: make local-repo RPM_SRC=$(LOCAL_RPM_REPO)" >&2
@@ -207,16 +207,24 @@ k8s-pkgs:
 		"gpgcheck=0" \
 		> /etc/yum.repos.d/kidi-local.repo
 	dnf -y --disablerepo=* --enablerepo=kidi-local install \
-		containerd.io kubelet-$(K8S_VERSION) kubeadm-$(K8S_VERSION) kubectl-$(K8S_VERSION)
-	# Configure containerd with the systemd cgroup driver (RHEL 9 / cgroup v2).
-	mkdir -p /etc/containerd
-	containerd config default > /etc/containerd/config.toml
-	sed -ri 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+		docker-ce kubelet-$(K8S_VERSION) kubeadm-$(K8S_VERSION) kubectl-$(K8S_VERSION)
+	# Docker daemon: use the systemd cgroup driver (RHEL 9 / cgroup v2).
+	mkdir -p /etc/docker
+	printf '%s\n' \
+		'{' \
+		'  "exec-opts": ["native.cgroupdriver=systemd"],' \
+		'  "log-driver": "json-file",' \
+		'  "log-opts": {"max-size": "100m"},' \
+		'  "storage-driver": "overlay2"' \
+		'}' \
+		> /etc/docker/daemon.json
+	systemctl enable --now docker >/dev/null 2>&1
+	# k8s 1.23 talks to Docker through the kubelet's built-in dockershim.
 	printf 'runtime-endpoint: unix://%s\nimage-endpoint: unix://%s\ntimeout: 10\n' "$(CRI_SOCKET)" "$(CRI_SOCKET)" > /etc/crictl.yaml
-	systemctl enable --now containerd >/dev/null 2>&1
 	systemctl enable kubelet >/dev/null 2>&1
-	echo "    installed: $$(rpm -q kubelet kubeadm kubectl containerd.io | tr '\n' ' ')"
-	echo "==> Packages installed; containerd active."
+	echo "    installed: $$(rpm -q docker-ce kubelet kubeadm kubectl | tr '\n' ' ')"
+	echo "    docker=$$(systemctl is-active docker)"
+	echo "==> Packages installed; docker active (dockershim runtime)."
 
 k8s-init:
 	$(require_root)
@@ -224,9 +232,12 @@ k8s-init:
 		echo "==> Cluster already initialized. Run 'make k8s-reset' first to redo."
 		exit 0
 	fi
-	echo "==> Pulling control-plane images (k8s v$(K8S_VERSION))"
-	kubeadm config images pull --kubernetes-version v$(K8S_VERSION) --cri-socket=$(CRI_SOCKET)
-	echo "==> kubeadm init (pod-cidr $(POD_CIDR))"
+	echo "==> Pre-pulling control-plane images via docker (k8s v$(K8S_VERSION))"
+	# dockershim has no socket until kubelet runs, so pull straight into Docker.
+	for img in $$(kubeadm config images list --kubernetes-version v$(K8S_VERSION)); do
+		docker pull "$$img"
+	done
+	echo "==> kubeadm init (pod-cidr $(POD_CIDR), cri-socket $(CRI_SOCKET))"
 	kubeadm init --pod-network-cidr=$(POD_CIDR) --kubernetes-version v$(K8S_VERSION) --cri-socket=$(CRI_SOCKET)
 	mkdir -p $$HOME/.kube && cp -f /etc/kubernetes/admin.conf $$HOME/.kube/config
 	export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -450,7 +461,7 @@ verify-k8s:
 	fi
 	# 4) Container runtime service active (detect which one).
 	rt=""
-	for svc in containerd crio docker; do
+	for svc in cri-docker docker containerd crio; do
 		if systemctl is-active --quiet "$$svc" 2>/dev/null; then rt="$$svc"; break; fi
 	done
 	if [[ -n "$$rt" ]]; then
@@ -464,8 +475,11 @@ verify-k8s:
 	else
 		echo "FAIL: kubelet not active." >&2; ok=0
 	fi
-	# 6) Node-local container check via crictl (works on workers too).
-	if command -v crictl >/dev/null 2>&1 && crictl ps >/dev/null 2>&1; then
+	# 6) Node-local container count: docker ps for dockershim, crictl for CRI runtimes.
+	if [[ "$$rt" == "docker" ]] && command -v docker >/dev/null 2>&1; then
+		running="$$(docker ps -q 2>/dev/null | wc -l)" || running=0
+		echo "    docker: $$running running container(s)"
+	elif command -v crictl >/dev/null 2>&1 && crictl ps >/dev/null 2>&1; then
 		running="$$(crictl ps -q 2>/dev/null | wc -l)" || running=0
 		echo "    crictl: $$running running container(s)"
 	fi
