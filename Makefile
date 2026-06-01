@@ -41,6 +41,14 @@ TARGET_VERSION   ?= 9.6
 BACKUP_ROOT      ?= backup
 FORCE            ?= 0
 
+# ---- Package-level rollback (downgrade to EXPECTED_CURRENT) ----
+# SOURCE_ISO   : DVD ISO of the current/source version (for 'make rollback-pkgs')
+# SOURCE_MOUNT : where the source ISO is mounted
+# UNDO_ID      : dnf history transaction id of the upgrade to undo (see 'dnf history list')
+SOURCE_ISO   ?=
+SOURCE_MOUNT ?= /mnt/rhel-src
+UNDO_ID      ?=
+
 # Custom repo support (used in ADDITION to the ISO repo).
 # Case A - repo already configured on the system: list its id(s) here
 #          (comma-separated), e.g. EXTRA_REPOS=internal,thirdparty
@@ -88,7 +96,7 @@ DNF_ARGS := --disablerepo=* --enablerepo=$(ENABLE_LIST)
 
 .PHONY: help set-dns local-repo k8s-prep k8s-pkgs k8s-init k8s-install k8s-reset k8s-status \
         preflight mount repo backup upgrade verify verify-k8s set-default commit \
-        rollback prepare status clean
+        rollback rollback-pkgs prepare status clean
 
 help:
 	@echo "RHEL $(EXPECTED_CURRENT) -> $(TARGET_VERSION) kernel upgrade + Kubernetes verification"
@@ -114,6 +122,7 @@ help:
 	@echo "  set-default Set the newest installed kernel as the default boot entry"
 	@echo "  commit      verify + verify-k8s + set-default (default set only if all pass)"
 	@echo "  rollback    Set the default boot entry back to the pre-upgrade kernel"
+	@echo "  rollback-pkgs  Downgrade packages to EXPECTED_CURRENT (dnf history undo UNDO_ID)"
 	@echo "  status      Show current kernel / default boot / release / mount"
 	@echo "  prepare     preflight + mount + repo + backup"
 	@echo "  clean       Unmount the ISO and remove generated repo files"
@@ -532,8 +541,49 @@ rollback:
 	grubby --set-default="$$prev"
 	echo "    Default kernel is now: $$(grubby --default-kernel)"
 	echo "==> Reboot to boot the previous kernel."
-	echo "    NOTE: this reverts the BOOT kernel only. To revert upgraded"
-	echo "          packages too, use 'dnf history undo <ID>' (see $$dir/dnf-history.txt)."
+	echo "    NOTE: this reverts the BOOT kernel only. To revert upgraded packages"
+	echo "          too, reboot then run 'make rollback-pkgs' (see below)."
+
+# Package-level rollback: downgrade every package the upgrade changed back to
+# the EXPECTED_CURRENT version via 'dnf history undo', using the source-version
+# ISO as the package source. Run AFTER 'make rollback' + reboot (so the node is
+# booted on the pre-upgrade kernel and the new kernel can be removed cleanly).
+rollback-pkgs:
+	$(require_root)
+	echo "==> Package-level rollback (downgrade to RHEL $(EXPECTED_CURRENT))"
+	# Guard: must be booted on the pre-upgrade kernel, not the newest one.
+	newest="$$(rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V | tail -1)"
+	if [[ "$$(uname -r)" == "$$newest" ]]; then
+		echo "ERROR: running the newest kernel ($$newest)." >&2
+		echo "       Run 'make rollback' + reboot first, then re-run this target." >&2
+		exit 1
+	fi
+	# Need the upgrade's transaction id.
+	if [[ -z "$(UNDO_ID)" ]]; then
+		echo "ERROR: set UNDO_ID=<upgrade transaction id>. Recent dnf history:" >&2
+		dnf history list 2>/dev/null | grep -E '^[[:space:]]*[0-9]+ ' | head -8 >&2
+		exit 1
+	fi
+	# Need the source-version ISO to supply the downgrade packages.
+	if [[ ! -f "$(SOURCE_ISO)" ]]; then
+		echo "ERROR: SOURCE_ISO not found: '$(SOURCE_ISO)' (the $(EXPECTED_CURRENT) DVD ISO)." >&2
+		exit 1
+	fi
+	mkdir -p "$(SOURCE_MOUNT)"
+	mountpoint -q "$(SOURCE_MOUNT)" || mount -o loop,ro "$(SOURCE_ISO)" "$(SOURCE_MOUNT)"
+	for d in BaseOS AppStream; do
+		[[ -d "$(SOURCE_MOUNT)/$$d" ]] || { echo "ERROR: $(SOURCE_MOUNT)/$$d missing." >&2; exit 1; }
+	done
+	printf '%s\n' \
+		"# $(MARKER)" \
+		"[rhel-src-baseos]" "name=RHEL source BaseOS" "baseurl=file://$(SOURCE_MOUNT)/BaseOS" "enabled=1" "gpgcheck=0" "" \
+		"[rhel-src-appstream]" "name=RHEL source AppStream" "baseurl=file://$(SOURCE_MOUNT)/AppStream" "enabled=1" "gpgcheck=0" \
+		> /etc/yum.repos.d/rhel-src.repo
+	echo "    Undoing transaction $(UNDO_ID) using the $(EXPECTED_CURRENT) ISO repo..."
+	dnf history undo $(UNDO_ID) -y --disablerepo=* --enablerepo=rhel-src-*
+	echo
+	echo "==> Downgrade complete. Release: $$(cat /etc/redhat-release)"
+	echo "    Verify with 'make verify-k8s'; run 'make clean' to drop the source repo."
 
 status:
 	echo "Release:        $$(cat /etc/redhat-release 2>/dev/null || echo n/a)"
@@ -568,5 +618,14 @@ clean:
 	if mountpoint -q "$(MOUNT)"; then
 		umount "$(MOUNT)"
 		echo "    Unmounted $(MOUNT)"
+	fi
+	# Source-version repo/mount used by rollback-pkgs.
+	if [[ -f /etc/yum.repos.d/rhel-src.repo ]]; then
+		rm -f /etc/yum.repos.d/rhel-src.repo
+		echo "    Removed /etc/yum.repos.d/rhel-src.repo"
+	fi
+	if mountpoint -q "$(SOURCE_MOUNT)"; then
+		umount "$(SOURCE_MOUNT)"
+		echo "    Unmounted $(SOURCE_MOUNT)"
 	fi
 	echo "==> Clean done (backups under $(BACKUP_ROOT)/ are kept)."
