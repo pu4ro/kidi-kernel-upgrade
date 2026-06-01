@@ -138,6 +138,35 @@ sudo reboot
 `rollback`은 **부팅 커널만** 되돌립니다. 패키지까지 되돌리려면
 `dnf history undo <ID>` (`$BACKUP_ROOT/latest/dnf-history.txt` 참고).
 
+### 백업/롤백 검증 결과 (실제 노드, RHEL 9.3 → 9.6)
+
+`make backup` 산출물과 `make rollback` 경로를 실제 노드에서 검증했습니다.
+
+**1) 백업 산출물 무결성** — `$BACKUP_ROOT/<timestamp>/`에 6개 파일 모두 생성·정상:
+
+| 파일 | 내용 | 결과 |
+|------|------|------|
+| `running-kernel.txt` | `5.14.0-362.8.1.el9_3.x86_64` | ✅ 업그레이드 전 커널 |
+| `release.txt` | `Red Hat Enterprise Linux release 9.3` | ✅ |
+| `default-kernel.txt` | `/boot/vmlinuz-...el9_3.x86_64` | ✅ |
+| `packages.txt` | 629개 (k8s/containerd 포함 전체 패키지) | ✅ |
+| `dnf-history.txt` / `grub-entries.txt` | 기록됨 | ✅ |
+| `latest` → `<timestamp>` 심볼릭 링크 | 정상 | ✅ |
+
+**2) 롤백 전제조건** — 백업에 기록된 el9_3 커널이 디스크에 그대로 있고 grubby도 인식(index=1) ✅
+
+**3) 롤백 경로 실제 테스트** (재부팅 없이 grubby 기본값만 전환 후 복구):
+
+```text
+before:           default = el9_6
+make rollback   → default = el9_3   # 백업값으로 정확히 전환 ✅
+make set-default → default = el9_6  # 복구 ✅
+final:            default = el9_6
+```
+
+> 참고: 실제로 el9_3 커널로 **재부팅**하는 시나리오는 운영 영향이 커서 수행하지 않았습니다.
+> 패키지 레벨 되돌리기(`dnf history undo <ID>`)는 위험해서 자동화하지 않고 안내만 합니다.
+
 ## 검증 기준 (commit 게이트)
 
 `make commit`은 다음을 **모두** 통과해야 최신 커널을 기본 부팅으로 확정합니다.
