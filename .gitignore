@@ -1,0 +1,9 @@
+# Local environment overrides (may contain host-specific paths)
+.env
+
+# Upgrade state snapshots produced at runtime
+backup/
+
+# Tooling state (not part of the deliverable)
+.omc/
+.claude/
